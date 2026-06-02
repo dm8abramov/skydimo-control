@@ -10,6 +10,8 @@
     <string>SkyDimoBar</string>
     <key>CFBundleDisplayName</key>
     <string>SkyDimoBar</string>
+    <key>CFBundleIconFile</key>
+    <string>SkyDimoBar</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
