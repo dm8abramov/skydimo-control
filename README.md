@@ -8,7 +8,7 @@ Confirmed settings for this machine:
 - Baudrate: `115200`
 - LED count: `65`
 - Protocol: `Ada` + LED count + RGB bytes
-- Default FPS: `60`
+- Default FPS: `80`
 - Color calibration: red `1.0`, green `0.72`, blue `0.25`
 
 ## Requirements
@@ -57,6 +57,8 @@ The app auto-detects the USB serial port and talks to it directly using the SkyD
 The output is color-calibrated because the strip's blue channel is visually too strong. This keeps white warmer and makes flame effects look less cold.
 
 On launch, the app restores the last selected menu preset and sends it to the strip immediately. Choosing `Off` clears that startup preset.
+
+The menu item `Turn Off When Display Sleeps` is enabled by default. When macOS puts the display to sleep, the app turns the strip off; when the display wakes, it restores the last saved preset.
 
 Manual rebuild after editing Swift code:
 

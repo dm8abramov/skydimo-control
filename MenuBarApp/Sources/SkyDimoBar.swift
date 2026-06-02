@@ -3,10 +3,11 @@ import Darwin
 import Foundation
 
 private let ledCount = 65
-private let defaultFrameRate = 60.0
+private let defaultFrameRate = 80.0
 private let minimumFrameRate = 10.0
 private let maximumFrameRate = 120.0
 private let lastPresetKey = "lastPreset"
+private let turnOffOnDisplaySleepKey = "turnOffOnDisplaySleep"
 private let redCalibration = 1.0
 private let greenCalibration = 0.72
 private let blueCalibration = 0.25
@@ -466,7 +467,7 @@ private final class ControlPanelWindowController: NSWindowController {
         speedSlider.toolTip = "Animation speed for Rainbow and Flame modes."
         flickerSlider.toolTip = "Amount of random-looking flame movement. Available only for Flame modes."
         intensitySlider.toolTip = "Flame heat. Higher values make the flame brighter and yellower."
-        fpsSlider.toolTip = "Frames sent to the strip per second. Available for animated modes; default is 60."
+        fpsSlider.toolTip = "Frames sent to the strip per second. Available for animated modes; default is 80."
 
         for slider in [brightnessSlider, speedSlider, flickerSlider, intensitySlider, fpsSlider] {
             slider.target = self
@@ -668,6 +669,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private var modeItems: [NSMenuItem] = []
+    private var turnOffOnDisplaySleepItem: NSMenuItem?
+    private var displaySleepTurnedOffStrip = false
     private lazy var controlPanel = ControlPanelWindowController(controller: controller) { [weak self] mode in
         self?.markAppliedMode(mode)
     }
@@ -675,6 +678,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItem()
         buildMenu()
+        observeDisplayPower()
         restoreLastPreset()
     }
 
@@ -729,6 +733,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let sleepItem = NSMenuItem(title: "Turn Off When Display Sleeps", action: #selector(toggleTurnOffOnDisplaySleep), keyEquivalent: "")
+        sleepItem.target = self
+        menu.addItem(sleepItem)
+        turnOffOnDisplaySleepItem = sleepItem
+        updateTurnOffOnDisplaySleepItem()
+
+        menu.addItem(.separator())
+
         let quitItem = NSMenuItem(title: "Quit SkyDimo", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -757,6 +769,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func activeModeTitle() -> String? {
         modeItems.first(where: { $0.state == .on })?.title
+    }
+
+    private func observeDisplayPower() {
+        let notificationCenter = NSWorkspace.shared.notificationCenter
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(displayDidSleep),
+            name: NSWorkspace.screensDidSleepNotification,
+            object: nil
+        )
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(displayDidWake),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
+    }
+
+    private func turnOffOnDisplaySleepEnabled() -> Bool {
+        if UserDefaults.standard.object(forKey: turnOffOnDisplaySleepKey) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: turnOffOnDisplaySleepKey)
+    }
+
+    private func updateTurnOffOnDisplaySleepItem() {
+        turnOffOnDisplaySleepItem?.state = turnOffOnDisplaySleepEnabled() ? .on : .off
     }
 
     private func markAppliedMode(_ mode: String?) {
@@ -874,6 +913,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func stopCurrentMode(_ sender: NSMenuItem) {
         select(nil)
         controller.stop()
+    }
+
+    @objc private func toggleTurnOffOnDisplaySleep(_ sender: NSMenuItem) {
+        let enabled = !turnOffOnDisplaySleepEnabled()
+        UserDefaults.standard.set(enabled, forKey: turnOffOnDisplaySleepKey)
+        updateTurnOffOnDisplaySleepItem()
+    }
+
+    @objc private func displayDidSleep(_ notification: Notification) {
+        guard turnOffOnDisplaySleepEnabled() else { return }
+        displaySleepTurnedOffStrip = UserDefaults.standard.string(forKey: lastPresetKey) != nil
+        controller.off()
+    }
+
+    @objc private func displayDidWake(_ notification: Notification) {
+        guard turnOffOnDisplaySleepEnabled(), displaySleepTurnedOffStrip else { return }
+        displaySleepTurnedOffStrip = false
+        restoreLastPreset()
     }
 
     @objc private func quit(_ sender: NSMenuItem) {
