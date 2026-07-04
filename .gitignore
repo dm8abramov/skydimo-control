@@ -4,3 +4,5 @@ __pycache__/
 
 MenuBarApp/build/
 *.log
+
+.idea

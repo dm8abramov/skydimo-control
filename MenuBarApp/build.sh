@@ -11,7 +11,7 @@ ICONSET="$ROOT/build/SkyDimoBar.iconset"
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RESOURCES"
 
-swiftc "$ROOT/Sources/SkyDimoBar.swift" \
+swiftc "$ROOT"/Sources/*.swift \
   -framework AppKit \
   -o "$MACOS/SkyDimoBar"
 
