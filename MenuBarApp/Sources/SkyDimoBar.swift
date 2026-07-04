@@ -7,6 +7,12 @@ private let defaultFrameRate = 80.0
 private let minimumFrameRate = 10.0
 private let maximumFrameRate = 120.0
 private let lastPresetKey = "lastPreset"
+private let selectedSerialPortKey = "selectedSerialPort"
+private let automaticSerialPortValue = "auto"
+private let customColorHexKey = "customColorHex"
+private let customColorBrightnessKey = "customColorBrightness"
+private let defaultCustomColorHex = "#ffb347"
+private let defaultCustomColorBrightness = 1.0
 private let turnOffOnDisplaySleepKey = "turnOffOnDisplaySleep"
 private let redCalibration = 1.0
 private let greenCalibration = 0.72
@@ -24,6 +30,16 @@ private struct RGB {
     let b: UInt8
 }
 
+private func parseRGB(_ hex: String) -> RGB {
+    let trimmed = hex.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+    let value = UInt32(trimmed, radix: 16) ?? 0
+    return RGB(
+        r: UInt8((value >> 16) & 0xff),
+        g: UInt8((value >> 8) & 0xff),
+        b: UInt8(value & 0xff)
+    )
+}
+
 private final class SerialPort {
     private var fd: Int32 = -1
 
@@ -31,10 +47,16 @@ private final class SerialPort {
         close()
     }
 
-    func open() throws {
+    func open(preferredPath: String?) throws {
         close()
 
-        let candidates = Self.portCandidates()
+        let candidates: [String]
+        if let preferredPath, !preferredPath.isEmpty {
+            candidates = [preferredPath]
+        } else {
+            candidates = Self.portCandidates()
+        }
+
         if candidates.isEmpty {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT), userInfo: [
                 NSLocalizedDescriptionKey: "SkyDimo serial port was not found. Tried /dev/cu.usbserial*, /dev/cu.wchusbserial*, /dev/cu.SLAB_USBtoUART*, /dev/cu.usbmodem*."
@@ -100,12 +122,14 @@ private final class SerialPort {
         tcflush(fd, TCIOFLUSH)
     }
 
-    private static func portCandidates() -> [String] {
+    fileprivate static func portCandidates() -> [String] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? []
-        return names
-            .filter { name in serialPortPrefixes.contains { name.hasPrefix($0) } }
-            .sorted()
-            .map { "/dev/\($0)" }
+        return serialPortPrefixes.flatMap { prefix in
+            names
+                .filter { $0.hasPrefix(prefix) }
+                .sorted()
+                .map { "/dev/\($0)" }
+        }
     }
 
     func write(_ bytes: [UInt8]) throws {
@@ -145,13 +169,31 @@ final class SkyDimoController {
     private var startedAt = Date()
     private var generation = 0
     private var frameRate = defaultFrameRate
+    private var selectedSerialPort: String? = {
+        let value = UserDefaults.standard.string(forKey: selectedSerialPortKey)
+        return value == automaticSerialPortValue ? nil : value
+    }()
 
     var currentFrameRate: Double {
         frameRate
     }
 
+    var currentSerialPort: String? {
+        selectedSerialPort
+    }
+
     func setFrameRate(_ value: Double) {
         frameRate = max(minimumFrameRate, min(maximumFrameRate, value))
+    }
+
+    func setSerialPort(_ value: String?) {
+        let normalized = value == automaticSerialPortValue ? nil : value
+        selectedSerialPort = normalized
+        if let normalized {
+            UserDefaults.standard.set(normalized, forKey: selectedSerialPortKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: selectedSerialPortKey)
+        }
     }
 
     fileprivate func runColor(_ color: RGB) {
@@ -169,15 +211,14 @@ final class SkyDimoController {
     func off() {
         stop()
         let offFrameRate = frameRate
-        queue.async { [serial, offFrameRate] in
+        let port = selectedSerialPort
+        queue.async { [serial, offFrameRate, port] in
             do {
-                try serial.open()
+                try serial.open(preferredPath: port)
                 try Self.sendOffFrames(using: serial, frames: Int(round(offFrameRate)), frameRate: offFrameRate)
                 serial.close()
             } catch {
-                DispatchQueue.main.async {
-                    Self.showError("Could not turn off SkyDimo:\n\(error.localizedDescription)")
-                }
+                serial.close()
             }
         }
     }
@@ -188,9 +229,10 @@ final class SkyDimoController {
         timer = nil
 
         let offFrameRate = frameRate
-        queue.sync { [serial, offFrameRate] in
+        let port = selectedSerialPort
+        queue.sync { [serial, offFrameRate, port] in
             do {
-                try serial.open()
+                try serial.open(preferredPath: port)
                 try Self.sendOffFrames(using: serial, frames: Int(round(offFrameRate)), frameRate: offFrameRate)
                 serial.close()
             } catch {
@@ -213,15 +255,14 @@ final class SkyDimoController {
         startedAt = Date()
         generation += 1
         let currentGeneration = generation
+        let port = selectedSerialPort
 
-        let didOpenPort = queue.sync { [serial] in
+        let didOpenPort = queue.sync { [serial, port] in
             do {
-                try serial.open()
+                try serial.open(preferredPath: port)
                 return true
             } catch {
-                DispatchQueue.main.async {
-                    Self.showError("SkyDimo serial error:\n\(error.localizedDescription)")
-                }
+                serial.close()
                 return false
             }
         }
@@ -237,9 +278,6 @@ final class SkyDimoController {
                 let elapsed = Date().timeIntervalSince(self.startedAt)
                 try self.serial.write(Self.frame(for: effect, elapsed: elapsed))
             } catch {
-                DispatchQueue.main.async {
-                    Self.showError("SkyDimo serial error:\n\(error.localizedDescription)")
-                }
                 self.stop()
             }
         }
@@ -373,21 +411,15 @@ final class SkyDimoController {
         max(minimum, min(maximum, value))
     }
 
-    private static func showError(_ message: String) {
-        let alert = NSAlert()
-        alert.messageText = "SkyDimo"
-        alert.informativeText = message
-        alert.alertStyle = .warning
-        alert.runModal()
-    }
 }
 
 private final class ControlPanelWindowController: NSWindowController {
     private let controller: SkyDimoController
     private let onModeApplied: (String?) -> Void
+    private let portPopup = NSPopUpButton()
     private let modePopup = NSPopUpButton()
     private let colorWell = NSColorWell()
-    private let brightnessSlider = NSSlider(value: 0.65, minValue: 0.05, maxValue: 1.0, target: nil, action: nil)
+    private let brightnessSlider = NSSlider(value: defaultCustomColorBrightness, minValue: 0.05, maxValue: 1.0, target: nil, action: nil)
     private let speedSlider = NSSlider(value: 0.45, minValue: 0.0, maxValue: 1.5, target: nil, action: nil)
     private let flickerSlider = NSSlider(value: 0.22, minValue: 0.0, maxValue: 1.0, target: nil, action: nil)
     private let intensitySlider = NSSlider(value: 0.45, minValue: 0.0, maxValue: 1.0, target: nil, action: nil)
@@ -404,7 +436,7 @@ private final class ControlPanelWindowController: NSWindowController {
         self.onModeApplied = onModeApplied
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 360, height: 368),
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 410),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -425,6 +457,7 @@ private final class ControlPanelWindowController: NSWindowController {
 
     func show(activeMode: String?) {
         fpsSlider.doubleValue = controller.currentFrameRate
+        refreshPorts()
         setMode(activeMode ?? "Custom Color", apply: false)
         showWindow(nil)
         window?.center()
@@ -444,6 +477,12 @@ private final class ControlPanelWindowController: NSWindowController {
         let title = NSTextField(labelWithString: "SkyDimo")
         title.font = .systemFont(ofSize: 22, weight: .semibold)
 
+        portPopup.target = self
+        portPopup.action = #selector(portChanged)
+        portPopup.toolTip = "Serial port used for the strip. Auto prefers /dev/cu.usbserial* devices."
+        portPopup.widthAnchor.constraint(equalToConstant: 230).isActive = true
+        refreshPorts()
+
         modePopup.addItems(withTitles: [
             "Custom Color",
             "Candle",
@@ -458,7 +497,8 @@ private final class ControlPanelWindowController: NSWindowController {
         modePopup.action = #selector(modeChanged)
         modePopup.toolTip = "Select what the strip should display."
 
-        colorWell.color = NSColor(calibratedRed: 1.0, green: 0.70, blue: 0.28, alpha: 1.0)
+        colorWell.color = savedCustomNSColor()
+        brightnessSlider.doubleValue = savedCustomBrightness()
         colorWell.target = self
         colorWell.action = #selector(apply)
         colorWell.toolTip = "Custom color. Available only in Custom Color mode."
@@ -476,6 +516,7 @@ private final class ControlPanelWindowController: NSWindowController {
         }
 
         root.addArrangedSubview(title)
+        root.addArrangedSubview(row(label: "Port", control: portPopup))
         root.addArrangedSubview(row(label: "Mode", control: modePopup))
         root.addArrangedSubview(row(label: "Color", control: colorWell))
         root.addArrangedSubview(sliderRow(label: "Brightness", slider: brightnessSlider, valueLabel: brightnessValue))
@@ -537,6 +578,13 @@ private final class ControlPanelWindowController: NSWindowController {
         setMode(modePopup.titleOfSelectedItem ?? "Custom Color", apply: true)
     }
 
+    @objc private func portChanged() {
+        guard !isUpdatingUI else { return }
+        let selected = portPopup.selectedItem?.representedObject as? String
+        controller.setSerialPort(selected)
+        apply()
+    }
+
     @objc private func sliderChanged() {
         updateValueLabels()
         apply()
@@ -567,6 +615,9 @@ private final class ControlPanelWindowController: NSWindowController {
             )
         case "Rainbow":
             controller.runRainbow(brightness: brightnessSlider.doubleValue, speed: speedSlider.doubleValue)
+        case "Custom Color":
+            saveCustomColor()
+            controller.runColor(rgb(from: colorWell.color, brightness: brightnessSlider.doubleValue))
         default:
             controller.runColor(rgb(from: colorWell.color, brightness: brightnessSlider.doubleValue))
         }
@@ -591,6 +642,42 @@ private final class ControlPanelWindowController: NSWindowController {
         fpsValue.stringValue = String(format: "%.0f", fpsSlider.doubleValue)
     }
 
+    private func refreshPorts() {
+        let selectedPort = controller.currentSerialPort
+        isUpdatingUI = true
+        portPopup.removeAllItems()
+
+        portPopup.addItem(withTitle: "Auto")
+        portPopup.lastItem?.representedObject = automaticSerialPortValue
+
+        let ports = SerialPort.portCandidates()
+        for port in ports {
+            portPopup.addItem(withTitle: port.replacingOccurrences(of: "/dev/", with: ""))
+            portPopup.lastItem?.representedObject = port
+        }
+
+        if let selectedPort, ports.contains(selectedPort) {
+            selectPortPopupValue(selectedPort)
+        } else if let selectedPort {
+            portPopup.addItem(withTitle: "\(selectedPort.replacingOccurrences(of: "/dev/", with: "")) (missing)")
+            portPopup.lastItem?.representedObject = selectedPort
+            selectPortPopupValue(selectedPort)
+        } else {
+            selectPortPopupValue(automaticSerialPortValue)
+        }
+        isUpdatingUI = false
+    }
+
+    private func selectPortPopupValue(_ value: String) {
+        for item in portPopup.itemArray {
+            if item.representedObject as? String == value {
+                portPopup.select(item)
+                return
+            }
+        }
+        portPopup.selectItem(at: 0)
+    }
+
     private func setMode(_ mode: String, apply: Bool) {
         isUpdatingUI = true
         modePopup.selectItem(withTitle: mode)
@@ -599,6 +686,9 @@ private final class ControlPanelWindowController: NSWindowController {
         }
 
         switch modePopup.titleOfSelectedItem ?? "Custom Color" {
+        case "Custom Color":
+            colorWell.color = savedCustomNSColor()
+            brightnessSlider.doubleValue = savedCustomBrightness()
         case "Candle":
             colorWell.color = NSColor(calibratedRed: 1.0, green: 0.70, blue: 0.28, alpha: 1.0)
             brightnessSlider.doubleValue = 1.0
@@ -615,12 +705,12 @@ private final class ControlPanelWindowController: NSWindowController {
             colorWell.color = .red
             brightnessSlider.doubleValue = 1.0
         case "Soft Flame":
-            brightnessSlider.doubleValue = 0.45
+            brightnessSlider.doubleValue = 1.0
             flickerSlider.doubleValue = 0.18
             speedSlider.doubleValue = 0.45
             intensitySlider.doubleValue = 0.45
         case "Rainbow":
-            brightnessSlider.doubleValue = 0.60
+            brightnessSlider.doubleValue = 1.0
             speedSlider.doubleValue = 0.20
         default:
             break
@@ -661,6 +751,36 @@ private final class ControlPanelWindowController: NSWindowController {
             g: UInt8(max(0, min(255, round(converted.greenComponent * brightness * 255)))),
             b: UInt8(max(0, min(255, round(converted.blueComponent * brightness * 255))))
         )
+    }
+
+    private func saveCustomColor() {
+        UserDefaults.standard.set(hex(from: colorWell.color), forKey: customColorHexKey)
+        UserDefaults.standard.set(brightnessSlider.doubleValue, forKey: customColorBrightnessKey)
+    }
+
+    private func savedCustomNSColor() -> NSColor {
+        let rgb = parseRGB(UserDefaults.standard.string(forKey: customColorHexKey) ?? defaultCustomColorHex)
+        return NSColor(
+            calibratedRed: CGFloat(rgb.r) / 255.0,
+            green: CGFloat(rgb.g) / 255.0,
+            blue: CGFloat(rgb.b) / 255.0,
+            alpha: 1.0
+        )
+    }
+
+    private func savedCustomBrightness() -> Double {
+        if UserDefaults.standard.object(forKey: customColorBrightnessKey) == nil {
+            return defaultCustomColorBrightness
+        }
+        return max(0.05, min(1.0, UserDefaults.standard.double(forKey: customColorBrightnessKey)))
+    }
+
+    private func hex(from color: NSColor) -> String {
+        let converted = color.usingColorSpace(.sRGB) ?? color
+        let red = Int(max(0, min(255, round(converted.redComponent * 255))))
+        let green = Int(max(0, min(255, round(converted.greenComponent * 255))))
+        let blue = Int(max(0, min(255, round(converted.blueComponent * 255))))
+        return String(format: "#%02x%02x%02x", red, green, blue)
     }
 }
 
@@ -854,9 +974,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "Red":
             controller.runColor(parseColor("#ff0000"))
         case "Soft Flame":
-            controller.runFlame(brightness: 0.45, flicker: 0.18, speed: 0.45)
+            controller.runFlame(brightness: 1.0, flicker: 0.18, speed: 0.45)
         case "Rainbow":
-            controller.runRainbow(brightness: 0.6, speed: 0.2)
+            controller.runRainbow(brightness: 1.0, speed: 0.2)
         default:
             controller.runColor(parseColor("#ff9f2e"))
         }
@@ -869,7 +989,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func customColor(_ sender: NSMenuItem) {
         select(sender)
         UserDefaults.standard.removeObject(forKey: lastPresetKey)
-        controlPanel.show(activeMode: "Custom Color")
+        let color = parseColor(UserDefaults.standard.string(forKey: customColorHexKey) ?? defaultCustomColorHex)
+        let brightness = savedCustomBrightness()
+        controller.runColor(RGB(
+            r: UInt8(max(0, min(255, round(Double(color.r) * brightness)))),
+            g: UInt8(max(0, min(255, round(Double(color.g) * brightness)))),
+            b: UInt8(max(0, min(255, round(Double(color.b) * brightness))))
+        ))
     }
 
     @objc private func candle(_ sender: NSMenuItem) {
@@ -895,13 +1021,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func softFlame(_ sender: NSMenuItem) {
         select(sender)
         savePreset(sender.title)
-        controller.runFlame(brightness: 0.45, flicker: 0.18, speed: 0.45)
+        controller.runFlame(brightness: 1.0, flicker: 0.18, speed: 0.45)
     }
 
     @objc private func rainbow(_ sender: NSMenuItem) {
         select(sender)
         savePreset(sender.title)
-        controller.runRainbow(brightness: 0.6, speed: 0.2)
+        controller.runRainbow(brightness: 1.0, speed: 0.2)
     }
 
     @objc private func off(_ sender: NSMenuItem) {
@@ -939,13 +1065,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func parseColor(_ hex: String) -> RGB {
-        let trimmed = hex.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
-        let value = UInt32(trimmed, radix: 16) ?? 0
-        return RGB(
-            r: UInt8((value >> 16) & 0xff),
-            g: UInt8((value >> 8) & 0xff),
-            b: UInt8(value & 0xff)
-        )
+        parseRGB(hex)
+    }
+
+    private func savedCustomBrightness() -> Double {
+        if UserDefaults.standard.object(forKey: customColorBrightnessKey) == nil {
+            return defaultCustomColorBrightness
+        }
+        return max(0.05, min(1.0, UserDefaults.standard.double(forKey: customColorBrightnessKey)))
     }
 }
 

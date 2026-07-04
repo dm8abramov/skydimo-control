@@ -46,8 +46,9 @@ def serial_port_candidates(port):
 
     return [
         f"/dev/{name}"
+        for prefix in PORT_PREFIXES
         for name in sorted(names)
-        if name.startswith(PORT_PREFIXES)
+        if name.startswith(prefix)
     ]
 
 
